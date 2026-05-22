@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>QOSYU — умный сбор вторсырья</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', system-ui, sans-serif; }
+        .card { transition: all 0.2s ease; }
+        .card:hover { transform: translateY(-2px); box-shadow: 0 10px 20px -5px rgba(0,0,0,0.1); }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb { background: #10b981; border-radius: 10px; }
+        .btn { transition: all 0.2s; }
+        .btn:active { transform: scale(0.97); }
+    </style>
+</head>
+<body class="bg-gray-50">
+
+<div class="flex flex-col lg:flex-row h-screen">
+    <div class="w-full lg:w-96 bg-white shadow-xl z-10 flex flex-col overflow-y-auto border-r border-gray-200">
+        <div class="p-6 border-b border-gray-100 bg-gradient-to-r from-emerald-600 to-teal-600 text-white">
+            <h1 class="text-2xl font-bold tracking-tight">♻️ QOSYU</h1>
+            <p class="text-emerald-100 text-sm mt-1">AI-агрегатор сбора отходов</p>
+        </div>
+        <div id="authPanel" class="p-5 border-b border-gray-100 bg-gray-50"></div>
+        <div id="mainPanel" class="flex-1 p-5 space-y-5 overflow-y-auto"></div>
+    </div>
+    <div class="flex-1 relative bg-gray-200">
+        <div id="map" class="absolute inset-0"></div>
+    </div>
+</div>
+
+<script>
+    const API_BASE = 'http://localhost:8000';
+    let currentToken = null;
+    let currentUser = null;
+    let map = null;
+    let markersLayer = null;
+    let zonesLayer = null;
+
+    // Хранилище для назначенных зон recycler (localStorage)
+    let myAssignedZones = JSON.parse(localStorage.getItem('myAssignedZones') || '[]');
+
+    function initMap() {
+        map = L.map('map').setView([43.2567, 76.9286], 12);
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> & CartoDB',
+            subdomains: 'abcd',
+            maxZoom: 19
+        }).addTo(map);
+        markersLayer = L.layerGroup().addTo(map);
+        zonesLayer = L.layerGroup().addTo(map);
+    }
+
+    async function apiCall(endpoint, method = 'GET', body = null, auth = true) {
+        const headers = { 'Content-Type': 'application/json' };
+        if (auth && currentToken) headers['Authorization'] = `Bearer ${currentToken}`;
+        const options = { method, headers };
+        if (body) options.body = JSON.stringify(body);
+        const resp = await fetch(`${API_BASE}${endpoint}`, options);
+        if (!resp.ok) {
+            let errorMsg = `Ошибка ${resp.status}`;
+            try { const data = await resp.json(); errorMsg = data.detail || data.message || errorMsg; } catch(e) {}
+            throw new Error(errorMsg);
+        }
+        if (resp.status === 204) return null;
+        return await resp.json();
+    }
+
+    async function login(email, password) {
+        try {
+            const data = await apiCall(`/auth/login?email=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}`, 'POST', null, false);
+            if (data.access_token) {
+                currentToken = data.access_token;
+                // Определяем роль
+                try {
+                    await apiCall('/requests/my', 'GET');
+                    currentUser = { email, role: 'sme', company_name: email.split('@')[0] };
+                } catch(e) {
+                    if(e.message.includes('403') || e.message.includes('Forbidden')) {
+                        currentUser = { email, role: 'recycler', company_name: email.split('@')[0] };
+                    } else {
+                        throw e;
+                    }
+                }
+                renderUI();
+                loadMapData();
+                return true;
+            }
+        } catch(err) {
+            alert(`Ошибка входа: ${err.message}`);
+            return false;
+        }
+    }
+
+    async function register(email, password, company_name, role) {
+        try {
+            await apiCall('/auth/register', 'POST', { email, password, company_name, role }, false);
+            alert('Регистрация успешна! Теперь войдите.');
+            return true;
+        } catch(err) {
+            alert(`Ошибка регистрации: ${err.message}`);
+            return false;
+        }
+    }
+
+    function logout() {
+        currentToken = null;
+        currentUser = null;
+        renderUI();
+        clearMapData();
+    }
+
+    async function loadMapData() {
+        clearMapData();
+        if (!currentUser) return;
+
+        if (currentUser.role === 'sme') {
+            try {
+                const requests = await apiCall('/requests/my', 'GET');
+                requests.forEach(req => {
+                    const marker = L.marker([req.latitude, req.longitude], {
+                        icon: L.divIcon({ className: 'bg-emerald-500 rounded-full w-4 h-4 border-2 border-white shadow' })
+                    }).bindPopup(`<b>Заявка #${req.id}</b><br>Тип: ${req.waste_type}<br>Вес: ${req.weight_kg} кг<br>Статус: ${req.status}`);
+                    markersLayer.addLayer(marker);
+                });
+            } catch(e) { console.warn(e); }
+        }
+
+        // Отображаем все открытые зоны
+        try {
+            const zones = await apiCall('/clustering/zones/open', 'GET');
+            zones.forEach(zone => {
+                const circle = L.circle([zone.centroid_lat, zone.centroid_lon], {
+                    radius: (zone.radius_km || 1) * 1000,
+                    color: '#f59e0b',
+                    weight: 2,
+                    fillColor: '#fbbf24',
+                    fillOpacity: 0.3
+                }).bindPopup(`<b>Зона #${zone.id}</b><br>Заявок: ${zone.request_count}<br>Вес: ${zone.total_weight_kg} кг`);
+                zonesLayer.addLayer(circle);
+            });
+        } catch(e) { console.warn(e); }
+    }
+
+    function clearMapData() {
+        markersLayer.clearLayers();
+        zonesLayer.clearLayers();
+    }
+
+    async function generateZones() {
+        if (currentUser.role !== 'sme') return alert('Только SME может генерировать зоны');
+        try {
+            const result = await apiCall('/clustering/generate-zones', 'POST');
+            alert(`Создано зон: ${result.zone_ids.length}`);
+            await loadMapData();
+            // Если текущий пользователь SME, то перезагрузить его данные
+            if (currentUser.role === 'sme') await loadSmeData();
+        } catch(e) {
+            alert(`Ошибка генерации зон: ${e.message}`);
+        }
+    }
+
+    async function renderUI() {
+        const authDiv = document.getElementById('authPanel');
+        const mainDiv = document.getElementById('mainPanel');
+        if (!currentToken || !currentUser) {
+            authDiv.innerHTML = `
+                <div class="space-y-3">
+                    <button id="showLoginBtn" class="w-full bg-emerald-600 text-white py-2 rounded-lg font-medium hover:bg-emerald-700 transition btn">Вход</button>
+                    <button id="showRegisterBtn" class="w-full bg-gray-200 text-gray-800 py-2 rounded-lg font-medium hover:bg-gray-300 transition btn">Регистрация</button>
+                </div>
+                <div id="authForm" class="mt-4"></div>
+            `;
+            document.getElementById('showLoginBtn').onclick = () => showLoginForm();
+            document.getElementById('showRegisterBtn').onclick = () => showRegisterForm();
+            showLoginForm();
+            mainDiv.innerHTML = `<div class="text-center text-gray-400 mt-10">👈 Войдите или зарегистрируйтесь</div>`;
+            return;
+        }
+
+        authDiv.innerHTML = `
+            <div class="flex justify-between items-center">
+                <div>
+                    <span class="font-semibold">${currentUser.company_name || currentUser.email}</span>
+                    <span class="text-xs bg-emerald-100 text-emerald-800 ml-2 px-2 py-0.5 rounded-full">${currentUser.role === 'sme' ? 'Бизнес' : 'Переработчик'}</span>
+                </div>
+                <button id="logoutBtn" class="text-red-500 text-sm hover:underline">Выйти</button>
+            </div>
+        `;
+        document.getElementById('logoutBtn').onclick = logout;
+
+        if (currentUser.role === 'sme') {
+            mainDiv.innerHTML = `
+                <div class="card bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                    <h2 class="text-lg font-bold text-gray-800 mb-3">➕ Новая заявка</h2>
+                    <select id="wasteType" class="w-full p-2 border rounded-lg mb-2">
+                        <option value="plastic">Пластик</option>
+                        <option value="cardboard">Картон</option>
+                        <option value="glass">Стекло</option>
+                        <option value="metal">Металл</option>
+                    </select>
+                    <input type="number" id="weight" placeholder="Вес (кг)" class="w-full p-2 border rounded-lg mb-2">
+                    <div class="text-xs text-gray-500 mb-2">📍 Координаты: центр карты</div>
+                    <button id="createRequestBtn" class="w-full bg-emerald-600 text-white py-2 rounded-lg font-medium hover:bg-emerald-700 transition btn">➕ Создать заявку</button>
+                </div>
+                <div class="card bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                    <h2 class="text-lg font-bold text-gray-800 mb-3">🗺️ Управление зонами</h2>
+                    <button id="generateZonesBtn" class="w-full bg-amber-500 text-white py-2 rounded-lg font-medium hover:bg-amber-600 transition btn">✨ Сгенерировать зоны сбора</button>
+                </div>
+                <div class="card bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                    <h2 class="text-lg font-bold text-gray-800 mb-3">📋 Мои заявки</h2>
+                    <div id="requestsList" class="max-h-60 overflow-y-auto text-sm space-y-2"></div>
+                </div>
+                <div class="card bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                    <h2 class="text-lg font-bold text-gray-800 mb-3">🌱 ESG-отчёт</h2>
+                    <div id="esgSme" class="text-sm">Загрузка...</div>
+                </div>
+            `;
+            document.getElementById('createRequestBtn').onclick = async () => {
+                const waste_type = document.getElementById('wasteType').value;
+                const weight_kg = parseFloat(document.getElementById('weight').value);
+                if (isNaN(weight_kg)) return alert('Введите вес');
+                const center = map.getCenter();
+                try {
+                    await apiCall('/requests/create', 'POST', {
+                        waste_type, weight_kg, latitude: center.lat, longitude: center.lng
+                    });
+                    alert('Заявка создана!');
+                    await loadSmeData();
+                    await loadMapData();
+                } catch(e) { alert(e.message); }
+            };
+            document.getElementById('generateZonesBtn').onclick = generateZones;
+            await loadSmeData();
+        } 
+        else if (currentUser.role === 'recycler') {
+            mainDiv.innerHTML = `
+                <div class="card bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                    <h2 class="text-lg font-bold text-gray-800 mb-3">📍 Открытые зоны</h2>
+                    <div id="openZonesList" class="max-h-60 overflow-y-auto text-sm space-y-2"></div>
+                </div>
+                <div class="card bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                    <h2 class="text-lg font-bold text-gray-800 mb-3">🔨 Мои зоны (в работе)</h2>
+                    <div id="myZonesList" class="max-h-60 overflow-y-auto text-sm space-y-2"></div>
+                </div>
+            `;
+            await loadRecyclerData();
+        }
+    }
+
+    async function loadSmeData() {
+        try {
+            const requests = await apiCall('/requests/my', 'GET');
+            const container = document.getElementById('requestsList');
+            if (container) {
+                container.innerHTML = requests.map(req => `<div class="p-2 bg-gray-50 rounded flex justify-between"><span>${req.waste_type} - ${req.weight_kg} кг</span><span class="text-xs text-gray-500">${req.status}</span></div>`).join('');
+            }
+            const esg = await apiCall('/analytics/esg/sme', 'GET');
+            const esgDiv = document.getElementById('esgSme');
+            if (esgDiv) {
+                esgDiv.innerHTML = `<div>♻️ Собрано: <b>${esg.total_recycled_kg} кг</b></div>
+                                    <div>🌍 CO₂ сэкономлено: <b>${esg.co2_saved_kg} кг</b></div>
+                                    <div>🌳 Эквивалент деревьев: <b>${esg.equivalent_trees}</b></div>`;
+            }
+        } catch(e) { console.warn(e); }
+    }
+
+    async function loadRecyclerData() {
+        try {
+            // Получаем открытые зоны
+            const openZones = await apiCall('/clustering/zones/open', 'GET');
+            const openContainer = document.getElementById('openZonesList');
+            if (openContainer) {
+                if (openZones.length === 0) {
+                    openContainer.innerHTML = '<div class="text-gray-400 text-sm">Нет открытых зон. Попросите SME сгенерировать зоны.</div>';
+                } else {
+                    openContainer.innerHTML = openZones.map(zone => `
+                        <div class="p-2 bg-gray-50 rounded flex justify-between items-center">
+                            <div><b>Зона #${zone.id}</b><br>Заявок: ${zone.request_count}, вес: ${zone.total_weight_kg} кг</div>
+                            <button onclick="assignZone(${zone.id})" class="bg-emerald-500 text-white px-3 py-1 rounded text-sm btn">Взять</button>
+                        </div>
+                    `).join('');
+                }
+            }
+
+            // Мои зоны (из localStorage)
+            const myContainer = document.getElementById('myZonesList');
+            if (myContainer) {
+                if (myAssignedZones.length === 0) {
+                    myContainer.innerHTML = '<div class="text-gray-400 text-sm">Нет взятых зон</div>';
+                } else {
+                    myContainer.innerHTML = myAssignedZones.map(zone => `
+                        <div class="p-2 bg-gray-50 rounded flex justify-between items-center">
+                            <div><b>Зона #${zone.id}</b><br>Заявок: ${zone.request_count}, вес: ${zone.total_weight_kg} кг</div>
+                            <button onclick="completeZone(${zone.id})" class="bg-blue-500 text-white px-3 py-1 rounded text-sm btn">Завершить</button>
+                        </div>
+                    `).join('');
+                }
+            }
+            await loadMapData();
+        } catch(e) { 
+            console.error(e);
+            const openContainer = document.getElementById('openZonesList');
+            if (openContainer) openContainer.innerHTML = `<div class="text-red-500">Ошибка загрузки: ${e.message}</div>`;
+        }
+    }
+
+    window.assignZone = async (zoneId) => {
+        try {
+            // Вызываем API назначения
+            await apiCall(`/recycler/zones/${zoneId}/assign`, 'POST');
+            // Получаем информацию о зоне из открытых (нужно заново запросить)
+            const openZones = await apiCall('/clustering/zones/open', 'GET');
+            const zone = openZones.find(z => z.id === zoneId);
+            if (zone) {
+                // Добавляем в localStorage
+                myAssignedZones.push(zone);
+                localStorage.setItem('myAssignedZones', JSON.stringify(myAssignedZones));
+                alert(`Зона ${zoneId} назначена! Теперь она в "Моих зонах".`);
+            } else {
+                alert(`Зона ${zoneId} назначена, но не найдена в списке открытых (возможно, уже была назначена).`);
+            }
+            await loadRecyclerData();
+        } catch(e) {
+            alert(`Ошибка назначения: ${e.message}`);
+        }
+    };
+
+    window.completeZone = async (zoneId) => {
+        try {
+            await apiCall(`/recycler/zones/${zoneId}/complete`, 'POST');
+            myAssignedZones = myAssignedZones.filter(z => z.id !== zoneId);
+            localStorage.setItem('myAssignedZones', JSON.stringify(myAssignedZones));
+            alert(`Зона ${zoneId} завершена! ESG обновлён.`);
+            await loadRecyclerData();
+            // Если текущий пользователь SME, обновить его данные (но он другой, так что просто перезагрузим карту)
+            if (currentUser && currentUser.role === 'sme') {
+                await loadSmeData();
+            }
+        } catch(e) {
+            alert(`Ошибка завершения: ${e.message}`);
+        }
+    };
+
+    function showLoginForm() {
+        const formDiv = document.getElementById('authForm');
+        if (!formDiv) return;
+        formDiv.innerHTML = `
+            <div class="space-y-3">
+                <input type="email" id="loginEmail" placeholder="Email" class="w-full p-2 border rounded">
+                <input type="password" id="loginPassword" placeholder="Пароль" class="w-full p-2 border rounded">
+                <button id="doLoginBtn" class="w-full bg-emerald-600 text-white py-2 rounded-lg btn">Войти</button>
+            </div>
+        `;
+        document.getElementById('doLoginBtn').onclick = async () => {
+            const email = document.getElementById('loginEmail').value;
+            const pwd = document.getElementById('loginPassword').value;
+            await login(email, pwd);
+        };
+    }
+
+    function showRegisterForm() {
+        const formDiv = document.getElementById('authForm');
+        formDiv.innerHTML = `
+            <div class="space-y-3">
+                <input type="email" id="regEmail" placeholder="Email" class="w-full p-2 border rounded">
+                <input type="text" id="regCompany" placeholder="Название компании" class="w-full p-2 border rounded">
+                <input type="password" id="regPassword" placeholder="Пароль" class="w-full p-2 border rounded">
+                <select id="regRole" class="w-full p-2 border rounded">
+                    <option value="sme">Бизнес (отправитель отходов)</option>
+                    <option value="recycler">Переработчик</option>
+                </select>
+                <button id="doRegisterBtn" class="w-full bg-emerald-600 text-white py-2 rounded-lg btn">Зарегистрироваться</button>
+            </div>
+        `;
+        document.getElementById('doRegisterBtn').onclick = async () => {
+            const email = document.getElementById('regEmail').value;
+            const company = document.getElementById('regCompany').value;
+            const pwd = document.getElementById('regPassword').value;
+            const role = document.getElementById('regRole').value;
+            await register(email, pwd, company, role);
+            showLoginForm();
+        };
+    }
+
+    initMap();
+    renderUI();
+</script>
+</body>
+</html>
